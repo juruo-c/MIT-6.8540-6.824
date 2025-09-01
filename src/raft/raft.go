@@ -23,6 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	// "fmt"
 
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
@@ -101,6 +102,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (3A).
+	rf.mutex.Lock()
+	defer rf.mutex.Unlock()
 	term = rf.currentTerm
 	isleader = (rf.state == Leader)
 	return term, isleader
@@ -171,17 +174,17 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mutex.Lock()
+	defer rf.mutex.Unlock()
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
 	}
 
 	if len(args.Entries) == 0 {
-		rf.mutex.Lock()
 		rf.state = Follower
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
-		rf.mutex.Unlock()
 
 		rf.elapseTime = 0
 		reply.Success = true
@@ -231,9 +234,19 @@ func (rf *Raft) getLastLogTerm() int{
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	rf.mutex.Lock()
+	defer rf.mutex.Unlock()
+
+	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = Follower
+		rf.votedFor = -1
+		reply.Term = rf.currentTerm
 	}
 
 	rf.elapseTime = 0
@@ -241,7 +254,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && 
 	UpToDate(args.LastLogTerm, args.LastLogIndex, rf.getLastLogTerm(), len(rf.log) - 1) {
 		rf.votedFor = args.CandidateId
-		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
 	} else {
 		reply.VoteGranted = false
@@ -281,25 +293,28 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) sendRequestVoteAndCollectReply(server int) {
+	rf.mutex.Lock()
 	args := RequestVoteArgs{
 		Term: rf.currentTerm,
 		CandidateId: rf.me,
 		LastLogIndex: len(rf.log) - 1,
 		LastLogTerm: rf.getLastLogTerm(),
 	}
+	rf.mutex.Unlock()
 
 	reply := RequestVoteReply{}
 	for !rf.sendRequestVote(server, &args, &reply) {
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	rf.mutex.Lock()
+	defer rf.mutex.Unlock()
 	if reply.VoteGranted {
 		rf.votedNum ++
 		if reply.Term > rf.currentTerm {
 			rf.currentTerm = reply.Term
 		}
 	}
-	rf.mutex.Unlock()
 }
 
 func (rf *Raft) boardRequestVote() {
@@ -322,17 +337,23 @@ func (rf *Raft) startNewTerm() {
 }
 
 func (rf *Raft) sendHeartBeat(server int) {
+	rf.mutex.Lock()
 	args := AppendEntriesArgs{
 		Term: rf.currentTerm,
 		LeaderId: rf.me,
 	}
+	rf.mutex.Unlock()
+
 	reply := AppendEntriesReply{}
 	for !rf.peers[server].Call("Raft.AppendEntries", &args, &reply) {
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
 func (rf *Raft) boardHeartBeat() {
+	rf.mutex.Lock()
 	rf.elapseTime = 0
+	rf.mutex.Unlock()
 	for id, _ := range rf.peers {
 		if id != rf.me {
 			go rf.sendHeartBeat(id)
@@ -384,26 +405,37 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
+		rf.mutex.Lock()
+		state := rf.state
+		elapseTime := rf.elapseTime
+		rf.mutex.Unlock()
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
-		switch (rf.state) {
+		switch (state) {
 		case Follower:
-			if rf.elapseTime >= rf.electionTimeout {
+			if elapseTime >= rf.electionTimeout {
+				rf.mutex.Lock()
 				rf.state = Candidate
+				rf.mutex.Unlock()
 				rf.startNewTerm()
 			}
 		case Candidate:
+			rf.mutex.Lock()
+			winElection := rf.votedNum >= (len(rf.peers) + 1) / 2
+			rf.mutex.Unlock()
 			// fmt.Printf("server %d: votedNum = %d\n", rf.me, rf.votedNum)
-			if rf.votedNum >= (len(rf.peers) + 1) / 2 { // win the election
+			if winElection { // win the election
+				rf.mutex.Lock()
 				rf.state = Leader
 				// fmt.Printf("server %d: become leader\n", rf.me)
+				rf.mutex.Unlock()
 				rf.boardHeartBeat()
-			} else if rf.elapseTime >= rf.electionTimeout {
+			} else if elapseTime >= rf.electionTimeout {
 				rf.startNewTerm()
-			} 
+			}
 		case Leader:
-			if rf.elapseTime >= HeartBeatTimeout {
+			if elapseTime >= HeartBeatTimeout {
 				rf.boardHeartBeat()
 			}
 		}
@@ -411,7 +443,9 @@ func (rf *Raft) ticker() {
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
 		ms := 50 + (rand.Int63() % 300)
+		rf.mutex.Lock()
 		rf.elapseTime += int(ms)
+		rf.mutex.Unlock()
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
