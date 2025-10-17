@@ -20,12 +20,15 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -120,12 +123,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -135,17 +139,13 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (3C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&rf.currentTerm) != nil ||
+		d.Decode(&rf.votedFor) != nil ||
+		d.Decode(&rf.log) != nil {
+		log.Fatalf("Server %v %p (Term: %v) readPersist error", rf.me, rf, rf.currentTerm)
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -185,6 +185,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// convert to follower
 	rf.currentTerm = args.Term
 	rf.convertState(Follower)
+	rf.persist()
 
 	// check previous log index
 	if args.PrevLogIndex > len(rf.log) {
@@ -201,6 +202,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.ConflictTerm, reply.ConflictIndex = rf.log[args.PrevLogIndex-1].Term, conflictIndex+1
 		// !!!! delete the conflict entries
 		rf.log = rf.log[:args.PrevLogIndex-1]
+		rf.persist()
 		return
 	}
 
@@ -212,6 +214,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log))
 		rf.applyCond.Signal()
 	}
+	rf.persist()
 }
 
 /* RequestVote RPC handler */
@@ -247,15 +250,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// convert to follower
 		rf.currentTerm = args.Term
 		rf.convertState(Follower)
+		rf.persist()
 	}
 
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
 		UpToDate(args.LastLogTerm, args.LastLogIndex, rf.getLastLogTerm(), len(rf.log)) {
 		rf.votedFor = args.CandidateId
 		rf.resetTimer()
+		rf.persist()
 		reply.Term, reply.VoteGranted = rf.currentTerm, true
 	} else {
 		rf.votedFor = -1
+		rf.persist()
 		reply.Term, reply.VoteGranted = rf.currentTerm, false
 	}
 }
@@ -296,6 +302,7 @@ func (rf *Raft) broadcastRequestVote() {
 							if reply.Term > rf.currentTerm {
 								rf.currentTerm = reply.Term
 								rf.convertState(Follower)
+								rf.persist()
 							}
 						}
 					}
@@ -342,6 +349,7 @@ func (rf *Raft) broadcastHeartBeat() {
 						if reply.Term > rf.currentTerm {
 							rf.currentTerm = reply.Term
 							rf.convertState(Follower)
+							rf.persist()
 						} else {
 							if reply.Success {
 								if len(args.Entries) > 0 {
@@ -350,7 +358,7 @@ func (rf *Raft) broadcastHeartBeat() {
 								}
 								rf.updateCommitIndex()
 							} else {
-								rf.nextIndex[server] = reply.ConflictIndex - 1
+								rf.nextIndex[server] = reply.ConflictIndex
 							}
 						}
 					}
@@ -391,6 +399,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.log = append(rf.log, Log{command, rf.currentTerm})
 	index = len(rf.log)
+	rf.persist()
 
 	// fmt.Printf("[Start] server %d start to append command %v index = %d\n", rf.me, command, index)
 
@@ -465,12 +474,12 @@ func (rf *Raft) ticker() {
 		// Check if a leader election should be started.
 
 		if rf.state == Follower {
-			if time.Since(rf.lastHeartBeat) > time.Duration(200+rand.Int63()%300)*time.Millisecond {
+			if time.Since(rf.lastHeartBeat) > time.Duration(getElectionTimeout())*time.Millisecond {
 				rf.convertState(Candidate)
 				rf.broadcastRequestVote()
 			}
 		} else if rf.state == Candidate {
-			if time.Since(rf.lastHeartBeat) > time.Duration(500+rand.Int63()%300)*time.Millisecond {
+			if time.Since(rf.lastHeartBeat) > time.Duration(getElectionTimeout())*time.Millisecond {
 				rf.resetTimer()
 				rf.broadcastRequestVote()
 			}
@@ -479,7 +488,7 @@ func (rf *Raft) ticker() {
 		}
 		rf.mu.Unlock()
 
-		// pause for a random amount of time between 1 and 20
+		// pause for a random amount of time between 50 and 100
 		// milliseconds.
 		ms := 50 + (rand.Int63() % 50)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
@@ -576,9 +585,11 @@ func (rf *Raft) convertState(state int) {
 	rf.state = state
 	if state == Follower {
 		rf.votedFor = -1
+		rf.persist()
 	} else if state == Candidate {
 		rf.currentTerm++
 		rf.votedFor = rf.me
+		rf.persist()
 	} else {
 		rf.initializeLeaderState()
 	}
