@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -32,8 +33,8 @@ type Op struct {
 }
 
 type LastReply struct {
-	seqId int
-	reply string
+	SeqId int
+	Reply string
 }
 
 type KVServer struct {
@@ -49,6 +50,8 @@ type KVServer struct {
 	kvstore   map[string]string
 	waitChs   map[int]chan Op
 	lastReply map[int64]LastReply
+
+	persister *raft.Persister
 }
 
 func (kv *KVServer) getWaitCh(index int) chan Op {
@@ -78,9 +81,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// check duplicate request
 	kv.mu.Lock()
 	last, ok := kv.lastReply[args.ClientId]
-	if ok && args.SeqId <= last.seqId {
+	if ok && args.SeqId <= last.SeqId {
 		reply.Err = OK
-		reply.Value = last.reply
+		reply.Value = last.Reply
 		kv.mu.Unlock()
 		return
 	}
@@ -103,7 +106,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// check duplicate request again
 	kv.mu.Lock()
 	last, ok = kv.lastReply[args.ClientId]
-	if ok && args.SeqId <= last.seqId {
+	if ok && args.SeqId <= last.SeqId {
 		kv.mu.Unlock()
 		kv.removeWaitCh(index)
 		reply.Err = OK
@@ -113,7 +116,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	select {
 	case appliedOp := <-ch:
-		if equalOp(&appliedOp, &op) {
+		if equalOp(&appliedOp, &op) && kv.rf.IsLeader() {
 			kv.mu.Lock()
 			reply.Err = OK
 			reply.Value = kv.kvstore[args.Key]
@@ -137,7 +140,7 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	// check duplicate request
 	kv.mu.Lock()
 	last, ok := kv.lastReply[args.ClientId]
-	if ok && args.SeqId <= last.seqId {
+	if ok && args.SeqId <= last.SeqId {
 		reply.Err = OK
 		kv.mu.Unlock()
 		return
@@ -162,7 +165,7 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	// check duplicate request again
 	kv.mu.Lock()
 	last, ok = kv.lastReply[args.ClientId]
-	if ok && args.SeqId <= last.seqId {
+	if ok && args.SeqId <= last.SeqId {
 		kv.mu.Unlock()
 		kv.removeWaitCh(index)
 		reply.Err = OK
@@ -193,7 +196,7 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	// check duplicate request
 	kv.mu.Lock()
 	last, ok := kv.lastReply[args.ClientId]
-	if ok && args.SeqId <= last.seqId {
+	if ok && args.SeqId <= last.SeqId {
 		reply.Err = OK
 		kv.mu.Unlock()
 		return
@@ -218,7 +221,7 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	// check duplicate request again
 	kv.mu.Lock()
 	last, ok = kv.lastReply[args.ClientId]
-	if ok && args.SeqId <= last.seqId {
+	if ok && args.SeqId <= last.SeqId {
 		kv.mu.Unlock()
 		kv.removeWaitCh(index)
 		reply.Err = OK
@@ -265,30 +268,36 @@ func (kv *KVServer) applyOp(op *Op) {
 	switch op.Type {
 	case GET:
 		kv.lastReply[op.ClientId] = LastReply{
-			seqId: op.SeqId,
-			reply: kv.kvstore[op.Key],
+			SeqId: op.SeqId,
+			Reply: kv.kvstore[op.Key],
 		}
 	case PUT:
 		kv.kvstore[op.Key] = op.Value
 		kv.lastReply[op.ClientId] = LastReply{
-			seqId: op.SeqId,
+			SeqId: op.SeqId,
 		}
 	case APPEND:
 		kv.kvstore[op.Key] += op.Value
 		kv.lastReply[op.ClientId] = LastReply{
-			seqId: op.SeqId,
+			SeqId: op.SeqId,
 		}
 	}
 }
 
 func (kv *KVServer) readApplied() {
 	for msg := range kv.applyCh {
+		if msg.SnapshotValid {
+			if msg.Snapshot != nil {
+				kv.decodeSnapshot(msg.Snapshot)
+			}
+			continue
+		}
 		kv.mu.Lock()
 		op := msg.Command.(Op)
 
 		// duplicate checking
 		last, ok := kv.lastReply[op.ClientId]
-		if ok && op.SeqId <= last.seqId {
+		if ok && op.SeqId <= last.SeqId {
 			kv.mu.Unlock()
 			continue
 		}
@@ -303,6 +312,45 @@ func (kv *KVServer) readApplied() {
 		if ok {
 			ch <- op
 		}
+
+		kv.snapshotCheck(msg.CommandIndex)
+	}
+}
+
+// for snapshot
+func (kv *KVServer) snapshotCheck(index int) {
+	if kv.maxraftstate == -1 {
+		return
+	}
+	if kv.persister.RaftStateSize() >= kv.maxraftstate {
+		snapshot := kv.encodeSnapshot()
+		kv.rf.Snapshot(index, snapshot)
+	}
+}
+
+func (kv *KVServer) encodeSnapshot() []byte {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.kvstore)
+	e.Encode(kv.lastReply)
+	return w.Bytes()
+}
+
+func (kv *KVServer) decodeSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) == 0 {
+		return
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&kv.kvstore) != nil ||
+		d.Decode(&kv.lastReply) != nil {
+		log.Fatalf("Server %v decode snapshot error", kv.me)
 	}
 }
 
@@ -336,6 +384,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.kvstore = make(map[string]string)
 	kv.waitChs = make(map[int]chan Op)
 	kv.lastReply = make(map[int64]LastReply)
+
+	kv.persister = persister
+	kv.decodeSnapshot(kv.persister.ReadSnapshot())
 
 	go kv.readApplied()
 

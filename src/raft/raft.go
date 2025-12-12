@@ -21,7 +21,6 @@ import (
 	//	"bytes"
 
 	"bytes"
-	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -119,6 +118,12 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
+func (rf *Raft) IsLeader() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.state == Leader
+}
+
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
@@ -158,7 +163,7 @@ func (rf *Raft) readPersist(data []byte) {
 		d.Decode(&rf.log) != nil ||
 		d.Decode(&rf.firstLogIndex) != nil ||
 		d.Decode(&rf.lastIncludedTerm) != nil {
-		log.Fatalf("Server %v %p (Term: %v) readPersist error", rf.me, rf, rf.currentTerm)
+		// log.Fatalf("Server %v %p (Term: %v) readPersist error", rf.me, rf, rf.currentTerm)
 	} else {
 		rf.commitIndex = rf.firstLogIndex - 1
 		rf.lastApplied = rf.commitIndex
@@ -183,6 +188,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.firstLogIndex = index + 1
 	rf.snapshot = snapshot
 	rf.persist(snapshot)
+
+	// log.Printf("[Term %d] server %d snapshot: fLogIndex=%d\n", rf.currentTerm, rf.me, rf.firstLogIndex)
 }
 
 func (rf *Raft) SnapshotWoLock(index int, snapshot []byte) {
@@ -227,12 +234,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.convertState(Follower)
 	rf.persist(nil)
 
+	// follower log is "ahead", success
+	if args.PrevLogIndex < rf.firstLogIndex-1 {
+		reply.Term, reply.Success = rf.currentTerm, true
+		return
+	}
+
 	// check previous log index
 	if args.PrevLogIndex > rf.getLastLogIndex() {
 		reply.Term, reply.Success = rf.currentTerm, false
 		reply.ConflictTerm, reply.ConflictIndex = 0, rf.getLastLogIndex()+1
 		return
 	}
+
+	// log.Printf("[Term %d] server %d get AE RPC {PrevIndex=%d, Elen=%d} fLogIndex=%d\n",
+	// 	rf.currentTerm, rf.me, args.PrevLogIndex, len(args.Entries), rf.firstLogIndex)
 
 	if args.PrevLogIndex >= rf.firstLogIndex && args.PrevLogTerm != rf.log[rf.getRealIndex(args.PrevLogIndex)].Term {
 		reply.Term, reply.Success = rf.currentTerm, false
@@ -339,13 +355,16 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	reply.Term = rf.currentTerm
 
+	// log.Printf("[Term %d] server %d get snapshot: {%v, %v} FLogIndex = %d\n",
+	// 	rf.currentTerm, rf.me, args.LastIncludedTerm, args.LastIncludedIndex, rf.firstLogIndex)
+
 	if args.LastIncludedIndex < rf.firstLogIndex {
 		return
 	}
 
 	if args.LastIncludedIndex >= rf.firstLogIndex {
 		rf.commitIndex = args.LastIncludedIndex
-		rf.lastApplied = args.LastIncludedIndex - 1
+		rf.lastApplied = args.LastIncludedIndex
 	}
 	if args.LastIncludedIndex <= rf.getLastLogIndex() {
 		rf.SnapshotWoLock(args.LastIncludedIndex, args.Data)
@@ -425,6 +444,8 @@ func (rf *Raft) broadcastHeartBeat() {
 					return
 				}
 				if rf.nextIndex[server] < rf.firstLogIndex {
+					// log.Printf("[Term %d] server %d send snapshot to server %d {nIndex:%d, fLogIndex:%d}\n",
+					// 	rf.currentTerm, rf.me, server, rf.nextIndex[server], rf.firstLogIndex)
 					go rf.sendSnapshot(server)
 					rf.mu.Unlock()
 					return
@@ -462,10 +483,14 @@ func (rf *Raft) broadcastHeartBeat() {
 								if len(args.Entries) > 0 {
 									rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
 									rf.matchIndex[server] = rf.nextIndex[server] - 1
+									// log.Printf("[Term %d] server %d AE to server %d successfully, mIndex=%d, nIndex=%d\n",
+									// 	rf.currentTerm, rf.me, server, rf.matchIndex[server], rf.nextIndex[server])
 								}
 								rf.updateCommitIndex()
 							} else {
 								rf.nextIndex[server] = reply.ConflictIndex
+								// log.Printf("[Term %d] server %d failed to AE server %d, nIndex=%d, pIndex=%d\n",
+								// 	rf.currentTerm, rf.me, server, rf.nextIndex[server], args.PrevLogIndex)
 							}
 						}
 					}
@@ -504,12 +529,16 @@ func (rf *Raft) sendSnapshot(server int) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 		if rf.state == Leader && args.Term == rf.currentTerm {
+			// log.Printf("[Term %d] server %d's snapshotRPC reply, lIIndex=%d, mIndex=%d\n",
+			// 	rf.currentTerm, server, args.LastIncludedIndex, rf.matchIndex[server])
 			if reply.Term > rf.currentTerm {
 				rf.currentTerm = reply.Term
 				rf.convertState(Follower)
-			} else if rf.firstLogIndex-1 > rf.matchIndex[server] {
-				rf.matchIndex[server] = rf.firstLogIndex - 1
-				rf.nextIndex[server] = rf.matchIndex[server] + 1
+			} else if args.LastIncludedIndex > rf.matchIndex[server] {
+				rf.matchIndex[server] = args.LastIncludedIndex
+				rf.nextIndex[server] = args.LastIncludedIndex + 1
+				// log.Printf("[Term %d] server %d install snapshot to server %d successfully, mIndex = %d, nIndex = %d\n",
+				// 	rf.currentTerm, rf.me, server, rf.matchIndex[server], rf.nextIndex[server])
 				rf.updateCommitIndex()
 			}
 		}
@@ -581,6 +610,7 @@ func (rf *Raft) updateCommitIndex() {
 		}
 		if count > len(rf.peers)/2 {
 			rf.commitIndex = N
+			// log.Printf("[Term %d] server %d update commit index to %d\n", rf.currentTerm, rf.me, rf.commitIndex)
 			rf.applyCond.Signal()
 			break
 		}
@@ -590,7 +620,7 @@ func (rf *Raft) updateCommitIndex() {
 func (rf *Raft) applyCommittedLog() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		for rf.lastApplied >= rf.commitIndex {
+		for rf.lastApplied >= rf.commitIndex && !rf.applySnapshot {
 			rf.applyCond.Wait()
 		}
 		if rf.applySnapshot {
@@ -603,6 +633,7 @@ func (rf *Raft) applyCommittedLog() {
 				SnapshotIndex: rf.firstLogIndex - 1,
 			}
 			rf.mu.Unlock()
+			// log.Printf("[Term %d] sever %d apply snapshot {%d, %d}\n", rf.currentTerm, rf.me, msg.SnapshotTerm, msg.SnapshotIndex)
 			rf.applyCh <- msg
 			rf.mu.Lock()
 			rf.lastApplied = msg.SnapshotIndex
@@ -650,8 +681,7 @@ func (rf *Raft) ticker() {
 
 		// pause for a random amount of time between 50 and 100
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 50)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		time.Sleep(HeartBeatTimeout * time.Millisecond)
 	}
 }
 
@@ -666,6 +696,7 @@ func (rf *Raft) ticker() {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	// log.Printf("======= server %d start =======\n", me)
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
@@ -712,6 +743,13 @@ func UpToDate(llTermC int, llIndexC int, llTermR int, llIndexR int) bool {
 
 func min(a, b int) int {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
 		return a
 	}
 	return b
