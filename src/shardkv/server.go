@@ -17,11 +17,16 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Type     string
-	Key      string
-	Value    string
-	SeqId    int
-	ClientId int64
+	Type      string
+	Key       string
+	Value     string
+	SeqId     int
+	ClientId  int64
+	NewConfig shardctrler.Config
+	ConfigNum int
+	Shard     int
+	Data      map[string]string
+	LastReply map[int64]LastReply
 }
 
 type LastReply struct {
@@ -47,8 +52,11 @@ type ShardKV struct {
 
 	persister *raft.Persister
 
-	sc     *shardctrler.Clerk
-	config shardctrler.Config
+	sc         *shardctrler.Clerk
+	config     shardctrler.Config
+	prevConfig shardctrler.Config
+
+	shardStatus [shardctrler.NShards]int
 }
 
 func (kv *ShardKV) getWaitCh(index int) chan Op {
@@ -78,20 +86,10 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// check the shard group
 	shard := key2shard(args.Key)
 	kv.mu.Lock()
-	if kv.config.Shards[shard] != kv.gid {
+	if kv.config.Shards[shard] != kv.gid ||
+		kv.shardStatus[shard] != ShardServing {
 		kv.mu.Unlock()
 		reply.Err = ErrWrongGroup
-		return
-	}
-	kv.mu.Unlock()
-
-	// check duplicate request
-	kv.mu.Lock()
-	last, ok := kv.lastReply[args.ClientId]
-	if ok && args.SeqId <= last.SeqId {
-		reply.Err = OK
-		reply.Value = last.Reply
-		kv.mu.Unlock()
 		return
 	}
 	kv.mu.Unlock()
@@ -108,18 +106,17 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	ch := kv.getWaitCh(index)
-
-	// check duplicate request again
+	// check the shard group
 	kv.mu.Lock()
-	last, ok = kv.lastReply[args.ClientId]
-	if ok && args.SeqId <= last.SeqId {
+	if kv.config.Shards[shard] != kv.gid ||
+		kv.shardStatus[shard] != ShardServing {
 		kv.mu.Unlock()
-		kv.removeWaitCh(index)
-		reply.Err = OK
+		reply.Err = ErrWrongGroup
 		return
 	}
 	kv.mu.Unlock()
+
+	ch := kv.getWaitCh(index)
 
 	select {
 	case appliedOp := <-ch:
@@ -128,6 +125,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 			reply.Err = OK
 			reply.Value = kv.kvstore[args.Key]
 			kv.mu.Unlock()
+			log.Printf("Get data from server-%d-%d, k,v={%v,%v}\n", kv.gid, kv.me, args.Key, reply.Value)
 		} else {
 			reply.Err = ErrWrongLeader
 		}
@@ -147,7 +145,8 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// check the shard group
 	shard := key2shard(args.Key)
 	kv.mu.Lock()
-	if kv.config.Shards[shard] != kv.gid {
+	if kv.config.Shards[shard] != kv.gid ||
+		kv.shardStatus[shard] != ShardServing {
 		kv.mu.Unlock()
 		reply.Err = ErrWrongGroup
 		return
@@ -182,18 +181,27 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	ch := kv.getWaitCh(index)
+	// check the shard group
+	kv.mu.Lock()
+	if kv.config.Shards[shard] != kv.gid ||
+		kv.shardStatus[shard] != ShardServing {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongGroup
+		return
+	}
+	kv.mu.Unlock()
 
 	// check duplicate request again
 	kv.mu.Lock()
 	last, ok = kv.lastReply[args.ClientId]
 	if ok && args.SeqId <= last.SeqId {
 		kv.mu.Unlock()
-		kv.removeWaitCh(index)
 		reply.Err = OK
 		return
 	}
 	kv.mu.Unlock()
+
+	ch := kv.getWaitCh(index)
 
 	select {
 	case appliedOp := <-ch:
@@ -204,6 +212,71 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		}
 	case <-time.After(800 * time.Millisecond):
 		reply.Err = ErrWrongLeader
+	}
+	kv.removeWaitCh(index)
+}
+
+func (kv *ShardKV) PullShardRPC(args *PullShardArgs, reply *PullShardReply) {
+	kv.mu.Lock()
+	if kv.config.Num < args.ConfigNum {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+
+	shard := args.Shard
+	if kv.shardStatus[shard] != ShardGC &&
+		kv.shardStatus[shard] != ShardServing {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	op := Op{
+		Type: PULLSHARD,
+	}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	if kv.config.Num < args.ConfigNum {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+	if kv.shardStatus[shard] != ShardGC &&
+		kv.shardStatus[shard] != ShardServing {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	ch := kv.getWaitCh(index)
+
+	select {
+	case appliedOp := <-ch:
+		if equalOp(&appliedOp, &op) && kv.rf.IsLeader() {
+			kv.mu.Lock()
+			data := make(map[string]string)
+			for k, v := range kv.kvstore {
+				if key2shard(k) == shard {
+					data[k] = v
+				}
+			}
+			reply.Data = data
+			reply.LastReply = copyLastReply(kv.lastReply)
+			kv.mu.Unlock()
+			reply.Err = OK
+		} else {
+			reply.Err = ErrWrongGroup
+		}
+	case <-time.After(800 * time.Millisecond):
+		reply.Err = ErrWrongGroup
 	}
 	kv.removeWaitCh(index)
 }
@@ -227,19 +300,63 @@ func (kv *ShardKV) killed() bool {
 func (kv *ShardKV) applyOp(op *Op) {
 	switch op.Type {
 	case GET:
-		kv.lastReply[op.ClientId] = LastReply{
-			SeqId: op.SeqId,
-			Reply: kv.kvstore[op.Key],
-		}
+		break
 	case PUT:
 		kv.kvstore[op.Key] = op.Value
 		kv.lastReply[op.ClientId] = LastReply{
 			SeqId: op.SeqId,
 		}
+		log.Printf("server-%d-%d apply client(%v) PUT (%d), value={%v}\n", kv.gid, kv.me, op.ClientId, op.SeqId, op.Value)
 	case APPEND:
 		kv.kvstore[op.Key] += op.Value
 		kv.lastReply[op.ClientId] = LastReply{
 			SeqId: op.SeqId,
+		}
+		log.Printf("server-%d-%d apply client(%v) APPEND {%d, %v}, value={%v}\n", kv.gid, kv.me, op.ClientId, op.SeqId, op.Value, kv.kvstore[op.Key])
+	case CONFIG:
+		if op.NewConfig.Num == kv.config.Num+1 {
+			if kv.config.Num == 0 {
+				for s := 0; s < shardctrler.NShards; s++ {
+					if op.NewConfig.Shards[s] == kv.gid {
+						kv.shardStatus[s] = ShardServing
+					}
+				}
+			} else {
+				for s := 0; s < shardctrler.NShards; s++ {
+					// get new shards
+					if kv.config.Shards[s] != kv.gid &&
+						op.NewConfig.Shards[s] == kv.gid &&
+						kv.shardStatus[s] != ShardInstalling {
+						kv.shardStatus[s] = ShardPulling
+					}
+					// lose old shards
+					if kv.config.Shards[s] == kv.gid &&
+						op.NewConfig.Shards[s] != kv.gid &&
+						kv.shardStatus[s] != ShardInstalling {
+						kv.shardStatus[s] = ShardGC
+					}
+				}
+			}
+			copyConfig(&kv.prevConfig, &kv.config)
+			kv.config = op.NewConfig
+		}
+	case SHARDINSTALL:
+		if op.ConfigNum != kv.config.Num {
+			return
+		}
+		log.Printf("server-%d-%d start install shard %d, shardStatus=%d\n", kv.gid, kv.me, op.Shard, kv.shardStatus[op.Shard])
+		if kv.shardStatus[op.Shard] == ShardInstalling ||
+			kv.shardStatus[op.Shard] == ShardPulling {
+			for k, v := range op.Data {
+				kv.kvstore[k] = v
+			}
+			for cid, new := range op.LastReply {
+				if old, ok := kv.lastReply[cid]; !ok || new.SeqId > old.SeqId {
+					kv.lastReply[cid] = new
+				}
+			}
+			kv.shardStatus[op.Shard] = ShardServing
+			log.Printf("server-%d-%d install shard %d over: kv={%v}\n", kv.gid, kv.me, op.Shard, kv.kvstore)
 		}
 	}
 }
@@ -255,11 +372,23 @@ func (kv *ShardKV) readApplied() {
 		kv.mu.Lock()
 		op := msg.Command.(Op)
 
+		// check the shard group
+		if op.Type == GET || op.Type == PUT || op.Type == APPEND {
+			shard := key2shard(op.Key)
+			if kv.config.Shards[shard] != kv.gid ||
+				kv.shardStatus[shard] != ShardServing {
+				kv.mu.Unlock()
+				continue
+			}
+		}
+
 		// duplicate checking
-		last, ok := kv.lastReply[op.ClientId]
-		if ok && op.SeqId <= last.SeqId {
-			kv.mu.Unlock()
-			continue
+		if op.Type == PUT || op.Type == APPEND {
+			last, ok := kv.lastReply[op.ClientId]
+			if ok && op.SeqId <= last.SeqId {
+				kv.mu.Unlock()
+				continue
+			}
 		}
 
 		kv.applyOp(&op)
@@ -296,6 +425,9 @@ func (kv *ShardKV) encodeSnapshot() []byte {
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.kvstore)
 	e.Encode(kv.lastReply)
+	e.Encode(kv.prevConfig)
+	e.Encode(kv.config)
+	e.Encode(kv.shardStatus)
 	return w.Bytes()
 }
 
@@ -309,16 +441,88 @@ func (kv *ShardKV) decodeSnapshot(snapshot []byte) {
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 	if d.Decode(&kv.kvstore) != nil ||
-		d.Decode(&kv.lastReply) != nil {
+		d.Decode(&kv.lastReply) != nil ||
+		d.Decode(&kv.prevConfig) != nil ||
+		d.Decode(&kv.config) != nil ||
+		d.Decode(&kv.shardStatus) != nil {
 		log.Fatalf("Server %v decode snapshot error", kv.me)
 	}
 }
 
 func (kv *ShardKV) configPuller() {
 	for !kv.killed() {
-		cfg := kv.sc.Query(-1)
 		kv.mu.Lock()
-		kv.config = cfg
+		nextNum := kv.config.Num + 1
+		kv.mu.Unlock()
+
+		cfg := kv.sc.Query(nextNum)
+		if cfg.Num == nextNum {
+			op := Op{
+				Type: CONFIG,
+			}
+			copyConfig(&op.NewConfig, &cfg)
+			kv.rf.Start(op)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (kv *ShardKV) pullOneShard(cfgNum int, shard int, servers []string) {
+	for _, sName := range servers {
+		server := kv.make_end(sName)
+		args := PullShardArgs{
+			ConfigNum: cfgNum,
+			Shard:     shard,
+		}
+		var reply PullShardReply
+		log.Printf("server-%d-%d pull shard %d from %v\n", kv.gid, kv.me, shard, sName)
+		ok := server.Call("ShardKV.PullShardRPC", &args, &reply)
+		if ok && reply.Err == OK {
+			op := Op{
+				Type:      SHARDINSTALL,
+				ConfigNum: cfgNum,
+				Shard:     shard,
+				Data:      copyKVStore(reply.Data),
+				LastReply: copyLastReply(reply.LastReply),
+			}
+			log.Printf("server-%d-%d get shard %d's data:{%v}\n", kv.gid, kv.me, shard, op.Data)
+			kv.rf.Start(op)
+			return
+		}
+	}
+
+	kv.mu.Lock()
+	if kv.shardStatus[shard] == ShardInstalling {
+		kv.shardStatus[shard] = ShardPulling
+	}
+	kv.mu.Unlock()
+}
+
+func (kv *ShardKV) pullShardLoop() {
+	for !kv.killed() {
+		kv.mu.Lock()
+		for s := 0; s < shardctrler.NShards; s++ {
+			if kv.shardStatus[s] == ShardPulling {
+				cfg := kv.config
+				oldGid := kv.prevConfig.Shards[s]
+				servers := kv.prevConfig.Groups[oldGid]
+				kv.shardStatus[s] = ShardInstalling
+				if oldGid == kv.gid {
+					kv.mu.Unlock()
+					op := Op{
+						Type:      SHARDINSTALL,
+						ConfigNum: cfg.Num,
+						Shard:     s,
+						Data:      make(map[string]string),
+						LastReply: make(map[int64]LastReply),
+					}
+					kv.rf.Start(op)
+					kv.mu.Lock()
+					continue
+				}
+				go kv.pullOneShard(cfg.Num, s, servers)
+			}
+		}
 		kv.mu.Unlock()
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -354,6 +558,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
+	labgob.Register(shardctrler.Config{})
+	labgob.Register(PullShardArgs{})
+	labgob.Register(PullShardReply{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -374,15 +581,22 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.waitChs = make(map[int]chan Op)
 	kv.lastReply = make(map[int64]LastReply)
 
-	kv.persister = persister
-	kv.decodeSnapshot(kv.persister.ReadSnapshot())
-
 	kv.sc = shardctrler.MakeClerk(kv.ctrlers)
 	kv.config = shardctrler.Config{}
+	kv.prevConfig = shardctrler.Config{}
+
+	for i := 0; i < shardctrler.NShards; i++ {
+		kv.shardStatus[i] = ShardGC
+	}
+
+	kv.persister = persister
+	kv.decodeSnapshot(kv.persister.ReadSnapshot())
 
 	go kv.readApplied()
 
 	go kv.configPuller()
+
+	go kv.pullShardLoop()
 
 	return kv
 }
@@ -390,4 +604,31 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 // helper function
 func equalOp(opA *Op, opB *Op) bool {
 	return opA.SeqId == opB.SeqId && opA.ClientId == opB.ClientId
+}
+
+func copyKVStore(kvstore map[string]string) map[string]string {
+	copy := make(map[string]string)
+	for k, v := range kvstore {
+		copy[k] = v
+	}
+	return copy
+}
+
+func copyLastReply(lastReply map[int64]LastReply) map[int64]LastReply {
+	copy := make(map[int64]LastReply)
+	for k, v := range lastReply {
+		copy[k] = v
+	}
+	return copy
+}
+
+func copyConfig(dst *shardctrler.Config, src *shardctrler.Config) {
+	dst.Num = src.Num
+	dst.Shards = src.Shards
+	dst.Groups = make(map[int][]string)
+	for gid, servers := range src.Groups {
+		copied := make([]string, len(servers))
+		copy(copied, servers)
+		dst.Groups[gid] = copied
+	}
 }

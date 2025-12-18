@@ -17,9 +17,19 @@ const (
 )
 
 const (
-	GET    = "GET"
-	PUT    = "PUT"
-	APPEND = "APPEND"
+	GET          = "GET"
+	PUT          = "PUT"
+	APPEND       = "APPEND"
+	CONFIG       = "CONFIG"
+	PULLSHARD    = "PULLSHARD"
+	SHARDINSTALL = "SHARDINSTALL"
+)
+
+const (
+	ShardServing = iota
+	ShardPulling
+	ShardInstalling
+	ShardGC
 )
 
 type Err string
@@ -51,4 +61,15 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+type PullShardArgs struct {
+	ConfigNum int
+	Shard     int
+}
+
+type PullShardReply struct {
+	Err       Err
+	Data      map[string]string
+	LastReply map[int64]LastReply
 }
